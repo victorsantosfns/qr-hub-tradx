@@ -66,6 +66,74 @@ async function initDB() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_leituras_id ON leituras (id)`);
+  // 22/09/2026, pedido do Victor: indicadores por região/dispositivo — a
+  // localização é resolvida pelo IP de quem está lendo NA HORA (rede
+  // móvel/wifi do local real), não por nenhum cadastro do aparelho. Ex. do
+  // próprio Victor: celular comprado/registrado nos EUA, mas a pessoa está
+  // em Recife lendo o QR — tem que aparecer Recife, porque é o IP de rede
+  // que importa, não o país de origem do aparelho.
+  await pool.query(`ALTER TABLE leituras ADD COLUMN IF NOT EXISTS cidade TEXT`);
+  await pool.query(`ALTER TABLE leituras ADD COLUMN IF NOT EXISTS regiao TEXT`);
+  await pool.query(`ALTER TABLE leituras ADD COLUMN IF NOT EXISTS pais TEXT`);
+  await pool.query(`ALTER TABLE leituras ADD COLUMN IF NOT EXISTS dispositivo TEXT`);
+  await pool.query(`ALTER TABLE leituras ADD COLUMN IF NOT EXISTS sistema TEXT`);
+  await pool.query(`ALTER TABLE leituras ADD COLUMN IF NOT EXISTS navegador TEXT`);
+}
+
+// Parser leve de User-Agent — só o suficiente pra identificar dispositivo/
+// SO/navegador nos indicadores, sem depender de biblioteca externa (o
+// serviço é deliberadamente mínimo, ver comentário no topo do arquivo).
+function analisarUserAgent(ua) {
+  ua = ua || '';
+  let dispositivo = 'Desktop';
+  if (/iPad/i.test(ua)) dispositivo = 'Tablet (iPad)';
+  else if (/Tablet|PlayBook/i.test(ua) || (/Android/i.test(ua) && !/Mobile/i.test(ua))) dispositivo = 'Tablet';
+  else if (/Mobi|iPhone|Android/i.test(ua)) dispositivo = 'Celular';
+
+  let sistema = 'Outro';
+  const iosMatch = ua.match(/OS (\d+)[_.](\d+)/);
+  const androidMatch = ua.match(/Android (\d+(\.\d+)?)/);
+  const winMatch = ua.match(/Windows NT (\d+\.\d+)/);
+  const macMatch = ua.match(/Mac OS X (\d+)[_.](\d+)/);
+  if (/iPhone|iPad|iPod/i.test(ua) && iosMatch) sistema = 'iOS ' + iosMatch[1] + '.' + iosMatch[2];
+  else if (androidMatch) sistema = 'Android ' + androidMatch[1];
+  else if (winMatch) sistema = 'Windows ' + winMatch[1];
+  else if (macMatch) sistema = 'macOS ' + macMatch[1] + '.' + macMatch[2];
+  else if (/Linux/i.test(ua)) sistema = 'Linux';
+
+  let navegador = 'Outro';
+  if (/EdgA|Edge|Edg\//i.test(ua)) navegador = 'Edge';
+  else if (/CriOS|Chrome/i.test(ua) && !/OPR|Opera/i.test(ua)) navegador = 'Chrome';
+  else if (/FxiOS|Firefox/i.test(ua)) navegador = 'Firefox';
+  else if (/OPR|Opera/i.test(ua)) navegador = 'Opera';
+  else if (/Instagram/i.test(ua)) navegador = 'Instagram (in-app)';
+  else if (/FBAN|FBAV/i.test(ua)) navegador = 'Facebook (in-app)';
+  else if (/WhatsApp/i.test(ua)) navegador = 'WhatsApp (in-app)';
+  else if (/Safari/i.test(ua)) navegador = 'Safari';
+
+  return { dispositivo, sistema, navegador };
+}
+
+// Geolocalização por IP — sem chave/cadastro (ip-api.com, uso não-comercial,
+// 45 req/min). É a localização de REDE no momento da leitura (torre de
+// celular/wifi local), não um dado salvo em algum cadastro do aparelho —
+// exatamente o que o Victor pediu. IP privado/local (rede interna, testes)
+// não tem geolocalização nenhuma — devolve tudo em branco de propósito.
+async function geolocalizarIp(ip) {
+  if (!ip || /^(127\.|10\.|192\.168\.|::1|172\.(1[6-9]|2\d|3[01])\.)/.test(ip)) {
+    return { cidade: null, regiao: null, pais: null };
+  }
+  try {
+    const controle = new AbortController();
+    const timeoutId = setTimeout(() => controle.abort(), 3000);
+    const resp = await fetch(`http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,country,regionName,city`, { signal: controle.signal });
+    clearTimeout(timeoutId);
+    const d = await resp.json();
+    if (d.status !== 'success') return { cidade: null, regiao: null, pais: null };
+    return { cidade: d.city || null, regiao: d.regionName || null, pais: d.country || null };
+  } catch (e) {
+    return { cidade: null, regiao: null, pais: null };
+  }
 }
 
 // Protege as duas rotas de sincronização (só o HUB TRADX deve conseguir
@@ -116,7 +184,7 @@ app.get('/api/leituras', exigirSegredo, async (req, res) => {
   const desdeId = Number(req.query.desdeId) || 0;
   try {
     const r = await pool.query(
-      'SELECT id, codigo, lido_em, ip, user_agent FROM leituras WHERE id > $1 ORDER BY id ASC LIMIT 5000',
+      'SELECT id, codigo, lido_em, ip, user_agent, cidade, regiao, pais, dispositivo, sistema, navegador FROM leituras WHERE id > $1 ORDER BY id ASC LIMIT 5000',
       [desdeId]
     );
     res.json({ leituras: r.rows });
@@ -141,9 +209,18 @@ app.get('/q/:codigo', async (req, res) => {
     }
     const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString().split(',')[0].trim().slice(0, 64);
     const userAgent = (req.headers['user-agent'] || '').slice(0, 500);
-    pool.query('INSERT INTO leituras (codigo, ip, user_agent) VALUES ($1,$2,$3)', [req.params.codigo, ip, userAgent])
-      .catch(e => console.error('Erro ao registrar leitura:', e.message));
+    // Redireciona JÁ — quem leu o QR não pode esperar a geolocalização (rede
+    // externa, ~100-300ms) nem o parse. Registro acontece depois, em
+    // background, sem atrasar a experiência de quem escaneou.
     res.redirect(302, r.rows[0].link_destino);
+    const { dispositivo, sistema, navegador } = analisarUserAgent(userAgent);
+    geolocalizarIp(ip).then(({ cidade, regiao, pais }) => {
+      return pool.query(
+        `INSERT INTO leituras (codigo, ip, user_agent, cidade, regiao, pais, dispositivo, sistema, navegador)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [req.params.codigo, ip, userAgent, cidade, regiao, pais, dispositivo, sistema, navegador]
+      );
+    }).catch(e => console.error('Erro ao registrar leitura:', e.message));
   } catch (e) {
     console.error('Erro ao processar leitura de QR code:', e.message);
     res.status(500).send('<h1>Erro ao processar QR Code</h1>');
