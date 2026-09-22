@@ -125,13 +125,19 @@ async function geolocalizarIp(ip) {
   }
   try {
     const controle = new AbortController();
-    const timeoutId = setTimeout(() => controle.abort(), 3000);
+    const timeoutId = setTimeout(() => controle.abort(), 6000);
     const resp = await fetch(`http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,country,regionName,city`, { signal: controle.signal });
     clearTimeout(timeoutId);
     const d = await resp.json();
     if (d.status !== 'success') return { cidade: null, regiao: null, pais: null };
     return { cidade: d.city || null, regiao: d.regionName || null, pais: d.country || null };
   } catch (e) {
+    // 22/09/2026: leituras chegando sem geo mesmo com IP válido — logar o
+    // motivo real aqui ajuda a diagnosticar via logs do Render (timeout,
+    // DNS, rate limit etc). O HUB também tenta de novo por conta própria
+    // (qrCompletarGeoPendente em api/server.js), então uma falha aqui não é
+    // definitiva — só atrasa até o próximo ciclo de retry.
+    console.error('[geo] falha ao geolocalizar IP', ip, ':', e.message);
     return { cidade: null, regiao: null, pais: null };
   }
 }
