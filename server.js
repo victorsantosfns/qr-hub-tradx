@@ -48,10 +48,14 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS qrcodes (
       codigo TEXT PRIMARY KEY,
-      link_destino TEXT NOT NULL,
+      link_destino TEXT,
       ativo BOOLEAN NOT NULL DEFAULT TRUE
     )
   `);
+  // 22/09/2026, pedido do Victor: dá pra criar o QR (e já imprimir) antes de
+  // ter o link final — cobre quem já tinha o serviço no ar antes dessa
+  // mudança (CREATE TABLE IF NOT EXISTS não altera tabela já existente).
+  await pool.query(`ALTER TABLE qrcodes ALTER COLUMN link_destino DROP NOT NULL`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS leituras (
       id SERIAL PRIMARY KEY,
@@ -83,10 +87,15 @@ app.post('/api/sync-qrcodes', exigirSegredo, async (req, res) => {
     await client.query('BEGIN');
     await client.query('DELETE FROM qrcodes');
     for (const q of lista) {
-      if (!q.codigo || !q.linkDestino) continue;
+      // 22/09/2026: linkDestino agora pode vir vazio (QR criado antes de
+      // definir o destino) — só o código é realmente obrigatório pra
+      // existir aqui. Sem isso, um QR sem link ficava de fora da
+      // sincronização e "sumia" (404 genérico em vez do aviso certo, ver
+      // /q/:codigo abaixo).
+      if (!q.codigo) continue;
       await client.query(
         'INSERT INTO qrcodes (codigo, link_destino, ativo) VALUES ($1,$2,$3)',
-        [q.codigo, q.linkDestino, q.ativo !== false]
+        [q.codigo, q.linkDestino || null, q.ativo !== false]
       );
     }
     await client.query('COMMIT');
@@ -123,6 +132,12 @@ app.get('/q/:codigo', async (req, res) => {
     const r = await pool.query('SELECT link_destino, ativo FROM qrcodes WHERE codigo = $1', [req.params.codigo]);
     if (!r.rows.length || !r.rows[0].ativo) {
       return res.status(404).send('<h1>QR Code não encontrado ou inativo</h1>');
+    }
+    // 22/09/2026: QR já existe e está ativo, mas ainda não tem link
+    // configurado (criado antes de definir o destino) — avisa direito em
+    // vez de tentar redirecionar pra "undefined" ou dar 404 enganoso.
+    if (!r.rows[0].link_destino) {
+      return res.status(200).send('<h1>Conteúdo em preparação</h1><p>Este QR Code ainda não tem um destino configurado. Tente novamente em breve.</p>');
     }
     const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString().split(',')[0].trim().slice(0, 64);
     const userAgent = (req.headers['user-agent'] || '').slice(0, 500);
